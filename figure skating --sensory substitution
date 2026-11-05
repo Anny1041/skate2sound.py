@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+冰上之音 · 实时骨骼追踪 → 空间音频转化
+======================================
+MediaPipe 0.10+ PoseLandmarker (33 关键点)
+实时提取速度 / 伸展度 / 空间位置 → 多维空间音频
+"""
+
+import cv2
+import numpy as np
+import sounddevice as sd
+import threading
+import time
+import sys
+import os
+
+# MediaPipe 0.10+ API
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.vision.pose_landmarker import PoseLandmarkerResult
+
+# ── 配置 ──
+MODEL_PATH = "/tmp/pose_landmarker_lite.task"
+SAMPLE_RATE = 44100
+BLOCK_SIZE = 1024
+VOLUME = 0.30
+VEL_ALPHA = 0.12
+SMOOTH_ALPHA = 0.35
+
+
+# ================================================================
+# 1. 特征提取
+# ================================================================
+class FeatureExtractor:
+    """
+    从 33 个关键点提取 4 维特征 [speed, stretch, spatial, richness]
+    关键点索引 (PoseLandmarker 标准):
+      0  鼻     11 左肩   12 右肩   13 左肘   14 右肘
+      15 左腕   16 右腕   23 左髋   24 右髋   25 左膝
+      26 右膝   27 左踝   28 右踝
+    """
+    def __init__(self):
+        self.prev_center = None
+        self.prev_time = None
+        self.smooth = np.zeros(4, dtype=np.float32)
+
+    def extract(self, landmarks, timestamp=None):
+        """
+        landmarks: list of NormalizedLandmark (33)
+        return: [speed, stretch, spatial, richness]
+        """
+        now = timestamp or time.time()
+        lm = landmarks
+
+        # 身体中心 (肩髋中点)
+        cx = np.mean([lm[11].x, lm[12].x, lm[23].x, lm[24].x])
+        cy = np.mean([lm[11].y, lm[12].y, lm[23].y, lm[24].y])
+
+        # ── 伸展度：关键点到身体中心的平均距离 ──
+        joint_idx = [11,12,23,24, 13,14,25,26, 15,16,27,28]
+        dists = [np.sqrt((lm[i].x-cx)**2 + (lm[i].y-cy)**2) for i in joint_idx]
+        stretch = min(1.0, np.mean(dists) / 0.35)
+
+        # ── 速度 ──
+        vel = 0.0
+        if self.prev_center is not None and self.prev_time is not None:
+            dt = now - self.prev_time
+            if dt > 0:
+                dx = cx - self.prev_center[0]
+                dy = cy - self.prev_center[1]
+                vel = np.sqrt(dx*dx + dy*dy) / dt
+        self.prev_center = (cx, cy)
+        self.prev_time = now
+        vel_norm = min(1.0, vel * 10)
+
+        # ── 空间位置 ──
+        sx = np.mean([lm[11].x, lm[12].x, lm[23].x, lm[24].x])
+        spatial = max(0.0, min(1.0, sx))
+
+        # ── 丰富度 ──
+        rich = min(1.0, stretch * 1.2 + vel_norm * 0.2)
+
+        feat = np.array([vel_norm, stretch, spatial, rich], dtype=np.float32)
+        self.smooth = SMOOTH_ALPHA * feat + (1 - SMOOTH_ALPHA) * self.smooth
+        return self.smooth
+
+
+# ================================================================
+# 2. 空间音频渲染器
+# ================================================================
+class AudioRenderer:
+    """5 层合成：基频 + 次谐波 + 泛音列 + 噪声 + 手部音"""
+
+    def __init__(self, sr=SAMPLE_RATE):
+        self.sr = sr
+        self.max_delay = int(0.002 * sr) + 2
+        self.db_l = np.zeros(self.max_delay * 2, dtype=np.float32)
+        self.db_r = np.zeros(self.max_delay * 2, dtype=np.float32)
+        self.dp_l = 0
+        self.dp_r = 0
+        self.zi_damp = np.zeros(1)
+
+    def _frac_delay(self, sig, delay, buf, pos):
+        n, blen = len(sig), len(buf)
+        out = np.zeros(n, dtype=np.float32)
+        p = pos
+        for i in range(n):
+            buf[p] = sig[i]
+            rp = (p - delay) % blen
+            ip = int(np.floor(rp))
+            fp = rp - ip
+            np_ = (ip + 1) % blen
+            out[i] = buf[ip] * (1 - fp) + buf[np_] * fp
+            p = (p + 1) % blen
+        return out, p
+
+    def render(self, f, frames, outdata):
+        """f: [speed, stretch, spatial, rich]"""
+        vel, ext, spatial, rich = f[0], f[1], f[2], f[3]
+
+        t = np.arange(frames, dtype=np.float32) / self.sr
+
+        # ── 1. 基频 (sawtooth, 速度驱动音高) ──
+        base = 75 + vel * 450
+        osc1 = 2.0 * (t * base - np.floor(t * base + 0.5))
+
+        # ── 2. 次谐波 (triangle, 半频) ──
+        sub = t * base * 0.5
+        osc2 = 2.0 * np.abs(2.0 * (sub - np.floor(sub + 0.5))) - 1.0
+
+        # ── 3. 泛音列 (伸展度控制数量和增益) ──
+        num_h = int(1 + ext * 4)
+        osc3 = np.zeros(frames, dtype=np.float32)
+        for h in range(2, 2 + num_h):
+            osc3 += np.sin(2 * np.pi * base * h * t + h * 0.3) * (ext * 0.08 / h)
+
+        # ── 4. 噪声层 (伸展度控制 棕噪→白噪混合 + 滤波) ──
+        white = np.random.randn(frames).astype(np.float32)
+        brown = np.cumsum(white) / np.sqrt(frames + 1)
+        brown /= np.max(np.abs(brown)) + 1e-6
+        noise = (1 - ext) * brown + ext * white
+        # 噪声滤波
+        nfc = 150 + ext * 5000
+        na = nfc / (nfc + self.sr)
+        nf = np.zeros_like(noise)
+        for i in range(1, len(noise)):
+            nf[i] = na * noise[i] + (1 - na) * nf[i-1]
+
+        # ── 5. 混合 ──
+        g1 = 0.15 + ext * 0.15
+        g2 = 0.12 * (1.0 - ext * 0.7)
+        g3 = ext * 0.20
+        gn = ext * 0.25
+        src = (osc1 * g1 + osc2 * g2 + osc3 * g3 + nf * gn)
+        src /= np.max(np.abs(src)) + 1e-6
+
+        # ── 主滤波 (伸展→亮度) ──
+        mfc = 180 + ext * 5000
+        ma = mfc / (mfc + self.sr)
+        sf = np.zeros_like(src)
+        for i in range(1, len(src)):
+            sf[i] = ma * src[i] + (1 - ma) * sf[i-1]
+        src = sf
+
+        # ── 空间化 ──
+        az = spatial * 2 - 1
+        itd = az * 0.001 * self.sr
+        left, self.dp_l = self._frac_delay(src.copy(), max(-itd, 0), self.db_l, self.dp_l)
+        right, self.dp_r = self._frac_delay(src.copy(), max(itd, 0), self.db_r, self.dp_r)
+
+        # ILD
+        ild = abs(az) * 0.35
+        if az > 0:
+            left = left * (1 - ild) + src * ild
+        elif az < 0:
+            right = right * (1 - ild) + src * ild
+
+        # ── 音量 ──
+        vol = 0.05 + 0.28 * max(vel * 1.3, ext * 1.1, 0.02)
+        vol = min(vol, 0.33) * VOLUME
+
+        out = np.column_stack([left * vol, right * vol])
+        gate = 0.002 * (1.0 - vel * 0.9)
+        out[np.abs(out) < gate] *= 0.1
+        outdata[:] = np.clip(out[:frames], -1.0, 1.0)
+
+
+# ================================================================
+# 3. 主程序
+# ================================================================
+def main():
+    print("=" * 56)
+    print("  冰上之音 · 实时骨骼 → 空间音频")
+    print("  MediaPipe PoseLandmarker 0.10+")
+    print("=" * 56)
+    print()
+
+    # ── 检查模型 ──
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ 模型未找到: {MODEL_PATH}")
+        print("请下载: curl -L https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task")
+        sys.exit(1)
+    print(f"✓ 模型: {MODEL_PATH}")
+
+    # ── 初始化 MediaPipe PoseLandmarker ──
+    try:
+        options = vision.PoseLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=vision.RunningMode.IMAGE,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        landmarker = vision.PoseLandmarker.create_from_options(options)
+        print("✓ PoseLandmarker 加载成功")
+    except Exception as e:
+        print(f"❌ 加载失败: {e}")
+        sys.exit(1)
+
+    # ── 摄像头 ──
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("❌ 无法打开摄像头")
+        sys.exit(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    print("✓ 摄像头已启动")
+
+    extractor = FeatureExtractor()
+    renderer = AudioRenderer()
+
+    shared = np.zeros(4, dtype=np.float32)
+    lock = threading.Lock()
+    active = threading.Event()
+    active.set()
+
+    def audio_cb(outdata, frames, time_info, status):
+        with lock:
+            feats = shared.copy()
+        renderer.render(feats, frames, outdata)
+
+    # ── 启动音频 ──
+    stream = sd.OutputStream(
+        samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE,
+        channels=2, callback=audio_cb, dtype='float32', latency='low',
+    )
+    stream.start()
+    print("✓ 音频流已启动")
+
+    cv2.namedWindow("冰上之音 · 实时空间音频 (Q退出)", cv2.WINDOW_GUI_NORMAL)
+    cv2.startWindowThread()
+
+    print()
+    print("  映射：")
+    print("    ⚡ 速度  → 基频 {75~525}Hz")
+    print("    🧘 伸展  → 噪声类型 + {1~5}层泛音 + 滤波{180~5000}Hz + 音量")
+    print("    📍 空间  → 立体声像 ITD + ILD")
+    print()
+    print("  [Q] 退出")
+    print()
+
+    frame_count = 0
+    start_time = time.time()
+
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # ── MediaPipe 推断 ──
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect(mp_image)
+
+            display = frame.copy()
+            h, w, _ = display.shape
+
+            if result and result.pose_landmarks and len(result.pose_landmarks) > 0:
+                landmarks = result.pose_landmarks[0]  # 取第一个检测到的人
+
+                # 特征提取
+                feats = extractor.extract(landmarks)
+                with lock:
+                    shared[:] = feats
+
+                vel, ext, spatial, rich = feats
+
+                # ── 绘制关键点 ──
+                connections = [
+                    (11,12),(11,13),(13,15),(12,14),(14,16),
+                    (11,23),(12,24),(23,24),(23,25),(25,27),
+                    (24,26),(26,28)
+                ]
+                for (a, b) in connections:
+                    if a < len(landmarks) and b < len(landmarks):
+                        x1, y1 = int(landmarks[a].x*w), int(landmarks[a].y*h)
+                        x2, y2 = int(landmarks[b].x*w), int(landmarks[b].y*h)
+                        cv2.line(display, (x1, y1), (x2, y2), (245, 117, 66), 2)
+
+                for i, lm in enumerate(landmarks):
+                    x, y = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(display, (x, y), 3, (245, 66, 230), -1)
+                    if i in [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]:
+                        label = {0:'鼻',11:'左肩',12:'右肩',13:'左肘',14:'右肘',
+                                 15:'左腕',16:'右腕',23:'左髋',24:'右髋',
+                                 25:'左膝',26:'右膝',27:'左踝',28:'右踝'}.get(i, '')
+                        cv2.putText(display, label, (x+5, y-2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255,100), 1)
+
+                # ── HUD ──
+                cv2.putText(display, "冰上之音 · 实时骨骼→空间音频",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+
+                # 伸展度高亮条
+                bar_x = int(ext * w * 0.6)
+                cv2.rectangle(display, (10, 50), (10+bar_x, 57), (120, 200, 255), -1)
+                cv2.putText(display, f"🧘 伸展度 {ext*100:.0f}%",
+                            (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+                cv2.putText(display,
+                    f"⚡速度:{vel:.2f}  📍空间:{spatial:.2f}  ✨丰富:{rich:.2f}",
+                    (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 230, 100), 1)
+
+                # 伸展度辐射圈
+                cxx = int(w * spatial)
+                cyy = int(h * 0.65)
+                for ang in np.linspace(0, 2*np.pi, 16):
+                    r = int(15 + ext * 80)
+                    ex = int(cxx + r * np.cos(ang))
+                    ey = int(cyy + r * np.sin(ang))
+                    cv2.line(display, (cxx, cyy), (ex, ey),
+                             (255-int(255*ext), 200, 100+int(155*ext)), 2)
+                cv2.circle(display, (cxx, cyy), int(15+ext*80), (120, 200, 255), 1)
+
+                # 参数条
+                items = [("速度", vel, (255,180,70)),
+                         ("伸展", ext, (120,200,255)),
+                         ("空间", spatial, (170,120,255)),
+                         ("丰富", rich, (255,100,200))]
+                for i, (lbl, val, clr) in enumerate(items):
+                    by = h - 80 + i * 18
+                    cv2.putText(display, f"{lbl}:{val:.2f}", (10, by),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, clr, 1)
+                    cv2.rectangle(display, (70, by-5), (70+140, by-5+5), (50,50,50), -1)
+                    cv2.rectangle(display, (70, by-5), (70+int(140*val), by-5+5), clr, -1)
+
+                # 空间位置线
+                sx_d = int(w * spatial)
+                cv2.line(display, (sx_d, 0), (sx_d, h), (170,120,255,40), 1)
+                cv2.circle(display, (sx_d, int(h*0.5)), 8, (170,120,255), -1)
+
+            else:
+                cv2.putText(display, "未检测到人体",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                with lock:
+                    shared[:] = 0.0
+
+            cv2.imshow("冰上之音 · 实时空间音频 (Q退出)", display)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            frame_count += 1
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        active.clear()
+        cap.release()
+        cv2.destroyAllWindows()
+        stream.stop()
+        stream.close()
+        elapsed = time.time() - start_time
+        print(f"已退出 · 处理 {frame_count} 帧 ({frame_count/elapsed:.1f} fps)")
+
+
+if __name__ == "__main__":
+    from mediapipe import Image as mp_Image
+    import mediapipe as mp
+    main()
